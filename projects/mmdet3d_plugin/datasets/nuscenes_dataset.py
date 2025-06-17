@@ -343,13 +343,13 @@ class CustomNuScenesDataset(NuScenesDataset):
             iou_max, gt_idx = ious.max(dim=1)  # (N,)
             matched = iou_max >= 0.5
 
-            matched_bbox_pred = bbox_2d_projected[matched]            # (K, 4)
+            # matched_bbox_pred = bbox_2d_projected[matched] # (K, 4)
+            bbox3d_matched = bbox3d[matched]
             matched_bbox_gt   = gt_bboxes_2d[gt_idx[matched]]         # (K, 4)
-            print(matched_bbox_pred)
-            print(matched_bbox_gt)
+            
             view_data = {
                 "cam_idx": cam_id,
-                "matched_pred": matched_bbox_pred,
+                "matched_pred": bbox3d_matched,
                 "matched_gt": matched_bbox_gt,
                 "iou": iou_max[matched]
             }
