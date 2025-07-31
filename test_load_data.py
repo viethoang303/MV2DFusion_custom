@@ -5,7 +5,7 @@ from mmcv import Config
 import os
 import torch
 
-cfg = Config.fromfile("/media/drive-2t/hoangnv83/MV2DFusion/projects/configs/nusc/custom_config.py")
+cfg = Config.fromfile("/media/drive-2t/hoangnv83/MV2DFusion_custom/projects/configs/nusc/custom_config.py")
 # import modules from plguin/xx, registry will be updated
 if hasattr(cfg, 'plugin'):
     if cfg.plugin:

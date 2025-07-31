@@ -623,7 +623,7 @@ data = dict(
         pipeline=test_pipeline,
         collect_keys=collect_keys + ['img', 'img_metas'],
         queue_length=queue_length,
-        ann_file=data_root + 'nuscenes2d_temporal_infos_val.pkl',
+        ann_file=data_root + 'nuscenes2d_temporal_infos_test.pkl',
         classes=class_names,
         modality=input_modality),
     shuffler_sampler=dict(type='InfiniteGroupEachSampleInBatchSampler'),

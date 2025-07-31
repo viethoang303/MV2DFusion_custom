@@ -1,0 +1,13 @@
+# pip install mmcv-full==1.6.1 -f https://download.openmmlab.com/mmcv/dist/cu111/torch1.10/index.html
+
+mmdet==2.25.1
+mmdet3d==1.0.0rc04
+mmcls==0.23.2
+mmsegmentation==0.28.0
+nuscenes-devkit
+av2
+refile==0.4.1
+spconv-cu117
+flash-attn==1.0.4
+torch-scatter==2.1.2
+# git+https://github.com/Abyssaledge/TorchEx.git

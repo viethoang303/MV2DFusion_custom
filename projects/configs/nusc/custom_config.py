@@ -552,7 +552,16 @@ model = dict(
             alpha=0.25,
             loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', loss_weight=0.25),
-        loss_iou=dict(type='GIoULoss', loss_weight=0.0), ),
+        loss_iou=dict(type='GIoULoss', loss_weight=0.0), 
+
+        loss_contrastive=dict(
+            type='SupCon3D2DLoss',#'Contrastive3D2DLoss',
+            dim2d=256,
+            dim3d=128,
+            proj_dim=512,
+            temperature=0.1,
+            loss_weight=1.0)
+        ),
     train_cfg=dict(fusion=dict(
         grid_size=[512, 512, 1],
         voxel_size=voxel_size,
@@ -564,17 +573,17 @@ model = dict(
             reg_cost=dict(type='BBox3DL1Cost', weight=0.25),
             iou_cost=dict(type='IoUCost', weight=0.0),  # Fake cost. This is just to make it compatible with DETR head.
             pc_range=point_cloud_range), )),
-    contrastive_head=dict(
-        type='ContrastiveProjector',
-        dim_2d=256,
-        dim_3d=128,
-        proj_dim=128,
-        loss_contrastive=dict(
-            type='SupConLoss',
-            # use_sigmoid=False,
-            loss_weight=0.01
-        )   # hoặc loại loss nào bạn muốn
-        ),
+    # contrastive_head=dict(
+    #     type='ContrastiveProjector',
+    #     dim_2d=256,
+    #     dim_3d=128,
+    #     proj_dim=128,
+    #     loss_contrastive=dict(
+    #         type='SupConLoss',
+    #         # use_sigmoid=False,
+    #         loss_weight=0.01
+    #     )   # hoặc loại loss nào bạn muốn
+    #     ),
     )
 
 

@@ -53,52 +53,52 @@ class GroupedItems(object):
     def __len__(self):
         return len(self.items)
 
-@LOSSES.register_module()
-class SupConLoss(nn.Module):
-    def __init__(self, loss_weight= 0.1, temperature=0.1):
-        super(SupConLoss, self).__init__()
-        self.loss_weight = loss_weight
-        self.temperature = temperature
+# @LOSSES.register_module()
+# class SupConLoss(nn.Module):
+#     def __init__(self, loss_weight= 0.1, temperature=0.1):
+#         super(SupConLoss, self).__init__()
+#         self.loss_weight = loss_weight
+#         self.temperature = temperature
 
-    def forward(self, feat2d, feat3d):
-        """
-        feat2d: Tensor [N, D]
-        feat3d: Tensor [N, D]
-        Assumes: feat2d[i] and feat3d[i] are positive pairs (same class)
-        """
-        assert feat2d.shape == feat3d.shape
-        N, D = feat2d.shape
+#     def forward(self, feat2d, feat3d):
+#         """
+#         feat2d: Tensor [N, D]
+#         feat3d: Tensor [N, D]
+#         Assumes: feat2d[i] and feat3d[i] are positive pairs (same class)
+#         """
+#         assert feat2d.shape == feat3d.shape
+#         N, D = feat2d.shape
 
-        device = feat2d.device
+#         device = feat2d.device
 
-        # Normalize features
-        z1 = F.normalize(feat2d, dim=1)
-        z2 = F.normalize(feat3d, dim=1)
+#         # Normalize features
+#         z1 = F.normalize(feat2d, dim=1)
+#         z2 = F.normalize(feat3d, dim=1)
 
-        # Combine: [2N, D]
-        features = torch.cat([z1, z2], dim=0)
+#         # Combine: [2N, D]
+#         features = torch.cat([z1, z2], dim=0)
 
-        # Compute similarity matrix: [2N, 2N]
-        sim = torch.matmul(features, features.T) / self.temperature
+#         # Compute similarity matrix: [2N, 2N]
+#         sim = torch.matmul(features, features.T) / self.temperature
 
-        # Create mask: positives are at (i, i+N) and (i+N, i)
-        labels = torch.arange(N).to(device)
-        labels = torch.cat([labels, labels], dim=0)  # [2N]
-        mask = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1)).float().to(device)
+#         # Create mask: positives are at (i, i+N) and (i+N, i)
+#         labels = torch.arange(N).to(device)
+#         labels = torch.cat([labels, labels], dim=0)  # [2N]
+#         mask = torch.eq(labels.unsqueeze(0), labels.unsqueeze(1)).float().to(device)
 
-        # Remove self-contrast
-        self_mask = torch.eye(2 * N, dtype=torch.bool).to(device)
-        mask = mask.masked_fill(self_mask, 0)
+#         # Remove self-contrast
+#         self_mask = torch.eye(2 * N, dtype=torch.bool).to(device)
+#         mask = mask.masked_fill(self_mask, 0)
 
-        # Compute log_softmax
-        logits = sim.masked_fill(self_mask, -1e9)
-        log_prob = F.log_softmax(logits, dim=1)
+#         # Compute log_softmax
+#         logits = sim.masked_fill(self_mask, -1e9)
+#         log_prob = F.log_softmax(logits, dim=1)
 
-        # Loss: average over positive pairs
-        loss = -(mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        loss = loss.mean()
+#         # Loss: average over positive pairs
+#         loss = -(mask * log_prob).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+#         loss = loss.mean()
 
-        return loss * self.loss_weight
+#         return loss * self.loss_weight
 
 # @LOSSES.register_module()
 # class SupConLossFast(nn.Module):
@@ -163,50 +163,50 @@ class SupConLoss(nn.Module):
 
 
 
-from mmcv.runner import force_fp32
-@HEADS.register_module()   # <-- đăng ký
-class ContrastiveProjector(BaseModule):
-    def __init__(self,
-                 dim_2d=256,
-                 dim_3d=128,
-                 proj_dim=128,
-                 loss_contrastive=None,    # nhận config loss từ model.contrastive_head.loss_contrastive
-                 init_cfg=None):
-        super().__init__(init_cfg)
-        self.proj_2d = nn.Sequential(
-            nn.Linear(dim_2d, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, proj_dim)
-        )
-        self.proj_3d = nn.Sequential(
-            nn.Linear(dim_3d, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, proj_dim)
-        )
-        # build loss layer ngay trong module
-        # loss_contrastive là dict giống loss_cls ở head khác
-        self.loss_contrastive = build_loss(loss_contrastive)
+# from mmcv.runner import force_fp32
+# @HEADS.register_module()   # <-- đăng ký
+# class ContrastiveProjector(BaseModule):
+#     def __init__(self,
+#                  dim_2d=256,
+#                  dim_3d=128,
+#                  proj_dim=128,
+#                  loss_contrastive=None,    # nhận config loss từ model.contrastive_head.loss_contrastive
+#                  init_cfg=None):
+#         super().__init__(init_cfg)
+#         self.proj_2d = nn.Sequential(
+#             nn.Linear(dim_2d, 256),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(256, proj_dim)
+#         )
+#         self.proj_3d = nn.Sequential(
+#             nn.Linear(dim_3d, 128),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(128, proj_dim)
+#         )
+#         # build loss layer ngay trong module
+#         # loss_contrastive là dict giống loss_cls ở head khác
+#         self.loss_contrastive = build_loss(loss_contrastive)
 
-    @force_fp32(apply_to=('feat_2d','feat_3d'))
-    def forward(self, feat_2d, feat_3d):
-        feat_2d = feat_2d.float()  # cần thiết nếu gọi từ ngoài vào
-        feat_3d = feat_3d.float()
-        p2d = F.normalize(self.proj_2d(feat_2d), dim=1)
-        p3d = F.normalize(self.proj_3d(feat_3d), dim=1)
-        return p2d, p3d
+#     @force_fp32(apply_to=('feat_2d','feat_3d'))
+#     def forward(self, feat_2d, feat_3d):
+#         feat_2d = feat_2d.float()  # cần thiết nếu gọi từ ngoài vào
+#         feat_3d = feat_3d.float()
+#         p2d = F.normalize(self.proj_2d(feat_2d), dim=1)
+#         p3d = F.normalize(self.proj_3d(feat_3d), dim=1)
+#         return p2d, p3d
     
-    @force_fp32(apply_to=('feat_2d','feat_3d'))
-    def loss(self, feat_2d, feat_3d):
-        """Tính contrastive loss và trả về dict giống các head khác"""
-        feat_2d = feat_2d.float()  # cần thiết nếu gọi từ ngoài vào
-        feat_3d = feat_3d.float()
-        p2d, p3d = self.forward(feat_2d, feat_3d)
-        # print("CHECK SHAPE:", p2d.shape, p3d.shape)
-        # ví dụ cross‑entropy contrastive
-        loss = self.loss_contrastive(p2d, p3d)
-        # print(self.loss_contrastive)
-        # print("LOSS", loss)
-        return {'loss_contrastive': loss}
+#     @force_fp32(apply_to=('feat_2d','feat_3d'))
+#     def loss(self, feat_2d, feat_3d):
+#         """Tính contrastive loss và trả về dict giống các head khác"""
+#         feat_2d = feat_2d.float()  # cần thiết nếu gọi từ ngoài vào
+#         feat_3d = feat_3d.float()
+#         p2d, p3d = self.forward(feat_2d, feat_3d)
+#         # print("CHECK SHAPE:", p2d.shape, p3d.shape)
+#         # ví dụ cross‑entropy contrastive
+#         loss = self.loss_contrastive(p2d, p3d)
+#         # print(self.loss_contrastive)
+#         # print("LOSS", loss)
+#         return {'loss_contrastive': loss}
 
 
 def extract_voxel_feats_from_bbox3d(voxel_feats, voxel_coords, bbox3d):
@@ -281,7 +281,7 @@ class MV2DFusion(MVXTwoStageDetector):
                  train_cfg=None,
                  test_cfg=None,
                  debug=None,
-                 contrastive_head=None,
+                #  contrastive_head=None,
                  ):
         self.dataset = dataset
         if pts_voxel_layer is not None:
@@ -317,7 +317,7 @@ class MV2DFusion(MVXTwoStageDetector):
             ))
             self.pts_query_generator = build_query_generator(pts_query_generator)
 
-        self.contrastive_head = build_head(contrastive_head)
+        # self.contrastive_head = build_head(contrastive_head)
 
         self.use_2d_proposal = use_2d_proposal
         self.gt_mono_loss = gt_mono_loss
@@ -437,7 +437,7 @@ class MV2DFusion(MVXTwoStageDetector):
                     data_t[key] = data[key][i]
                 elif key not in ['pair']: #else:
                     data_t[key] = data[key][:, i]
-            data_t['pair'] = data['pair']
+            # data_t['pair'] = data['pair']
             data_t['img_feats'] = data_t['img_feats']
             if i >= num_nograd_frames:
                 requires_grad = True
@@ -692,7 +692,8 @@ class MV2DFusion(MVXTwoStageDetector):
                 if sum([len(p) for p in dets]) == 0:
                     proposal = torch.tensor([[10, 20, 30, 40, 0, 1]], dtype=dets[0].dtype, device=dets[0].device)
                     dets = [proposal] + dets[1:]
-
+                # for det in dets:
+                #     print("detection:", det.shape, det.max(), det.min())
                 rois = bbox2roi(dets)
             self.train()
 
@@ -727,16 +728,18 @@ class MV2DFusion(MVXTwoStageDetector):
             pts_feat, pts_pos, pts_query_feat, pts_query_center = self.pts_query_generator(
                 out_dict['voxel_feats'], out_dict['voxel_coors'], out_dict['voxel_xyz'], out_dict['query_feats'],
                 out_dict['query_xyz'], out_dict['query_pred'], out_dict['query_cat'], B)
-            # print("POINT", out_dict['query_feats'][0].shape)
-            # print("IMAGE", len(dyn_feats["query_feats"]), dyn_feats["query_feats"][0].shape)
-            losses_pts = out_dict['losses']
 
+            losses_pts = out_dict['losses']
+            # print(pts_query_feat.shape, dyn_feats.shape)
             outs = self.fusion_bbox_head(img_metas, dyn_query=dyn_query, dyn_feats=dyn_feats_pred,
                                       pts_query_center=pts_query_center, pts_query_feat=pts_query_feat,
                                       pts_feat=pts_feat, pts_pos=pts_pos, pts_shape=None, **data)
-
+            # OUT: dict_keys(['all_cls_scores', 'all_bbox_preds', 'dyn_cls_scores', 'dyn_bbox_preds', 'dn_mask_dict'])
+            # print("OUT:", outs.keys())
+            print("ABC", out_dict["voxel_feats"].shape, out_dict['voxel_xyz'].shape, pts_feat.shape, pts_pos.shape, feats_det[0].max(), feats_det[0].min())
         if return_losses:
-            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
+            loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs, out_dict["voxel_feats"], out_dict['voxel_xyz'], feats_det, data["lidar2img"], data["img"].shape[-2:]]
+            # loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs, pts_feat, pts_pos, feats_det, data["lidar2img"]]
 
             # fusion head loss
             losses = self.fusion_bbox_head.loss(*loss_inputs)
@@ -768,9 +771,9 @@ class MV2DFusion(MVXTwoStageDetector):
                                                dim=1).to(imgs_det.device).clone() for b in gt_bboxes_3d]
                     for x in gt_bboxes_3d_:
                         x[:, 6:] = 0
-                    loss_cls, loss_bbox = self.fusion_bbox_head.loss_single(cls_scores, bbox_preds, gt_bboxes_3d_,
+                    loss_cls, loss_bbox, loss_contrastive = self.fusion_bbox_head.loss_single(cls_scores, bbox_preds, gt_bboxes_3d_,
                                                                          gt_labels_3d)
-                    losses_img_qg.update({'loss_cls': loss_cls, 'loss_bbox': loss_bbox})
+                    losses_img_qg.update({'loss_cls': loss_cls, 'loss_bbox': loss_bbox, 'loss_contrastive': loss_contrastive})
 
                 for k, v in losses_img_qg.items():
                     losses['imgqg.' + k] = v
@@ -781,46 +784,6 @@ class MV2DFusion(MVXTwoStageDetector):
                     if 'det2d.' not in k:
                         losses[k] = v * self.loss_weight_3d
 
-            pairs = data.get('pair', [])
-            if len(pairs) > 0:
-                M = len(pairs)
-                # print(pairs[0])
-                print(data["gt_bboxes"])
-                b3d = torch.stack([pairs[1][i] for i in pairs], dim=0)
-                b2d = torch.stack([pairs[0][i] for i in pairs], dim=0)
-                # b3d = torch.stack([data["gt_bboxes_3d"][0].tensor[p[0]] for p in pairs], dim=0)
-                # b2d = torch.stack([data["gt_bboxes"][0][0][p[1]] for p in pairs], dim=0)
-
-                # feat3d = extract_voxel_feats_from_bbox3d(out_dict["voxel_feats"].clone(), out_dict["voxel_coors"].clone(), b3d)
-                
-                
-                fmap2d = data['img_feats'][:, -1] #rec_feats[:, -1]  # shape (B, C, H, W)
-
-                b2d = b2d.squeeze(1)
-                rois2d = bbox2roi([b2d])
-                roi2d_feats = self.img_roi_extractor([fmap2d], rois2d)
-                feat2d = F.adaptive_avg_pool2d(roi2d_feats, (1, 1))
-                feat2d = feat2d.view(feat2d.size(0),-1)
-                
-                b3d = b3d.squeeze(1)
-                rois3d = bbox2roi([b3d])
-                roi3d_feats = self.img_roi_extractor([fmap2d], rois3d)
-                feat3d = F.adaptive_avg_pool2d(roi3d_feats, (1, 1))
-                feat3d = feat3d.view(feat3d.size(0),-1)
-                
-                losses.update(self.contrastive_head.loss(feat2d, feat3d))
-                
-            else:
-                device = data['img_feats'].device
-
-                dim2d = self.contrastive_head.proj_2d[0].in_features
-                dim3d = self.contrastive_head.proj_3d[0].in_features
-
-                dummy_p2d = torch.zeros((1, dim2d), device=device, requires_grad=True)
-                dummy_p3d = torch.zeros((1, dim3d), device=device, requires_grad=True)
-
-                p2d_all, p3d_all = self.contrastive_head(dummy_p2d, dummy_p3d)
-                losses["loss_contrastive"] = F.mse_loss(p2d_all, p3d_all).mean()
             return losses
         else:
             return None
@@ -842,11 +805,11 @@ class MV2DFusion(MVXTwoStageDetector):
         rec_img_feats, rec_img_feats_for_det = self.extract_img_feat(rec_img, self.num_frame_backbone_grads)
 
         if T - self.num_frame_backbone_grads > 0:
-            self.eval()
-            with torch.no_grad():
-                prev_img_feats, prev_img_feats_for_det = self.extract_img_feat(prev_img,
+            # self.eval()
+            # with torch.no_grad():
+            prev_img_feats, prev_img_feats_for_det = self.extract_img_feat(prev_img,
                                                                                T - self.num_frame_backbone_grads, True)
-            self.train()
+            # self.train()
             data['img_feats'] = torch.cat([prev_img_feats, rec_img_feats], dim=1)
 
             prev_T = T - self.num_frame_backbone_grads

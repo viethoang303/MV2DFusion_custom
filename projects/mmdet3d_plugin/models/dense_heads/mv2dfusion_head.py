@@ -17,6 +17,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from mmcv.cnn import Linear, bias_init_with_prob, ConvModule
 from mmcv.cnn.bricks.transformer import build_transformer_layer
@@ -40,6 +41,11 @@ from projects.mmdet3d_plugin.models.utils.positional_encoding import pos2posemb3
 from projects.mmdet3d_plugin.models.utils.misc import MLN, topk_gather, transform_reference_points, memory_refresh, \
     SELayer_Linear
 
+from mmdet3d.ops import RoIAwarePool3d, RoIPointPool3d
+from mmdet.models import HEADS, LOSSES, build_loss, build_head
+from mmcv.runner import ModuleList
+from mmdet.core import bbox2roi
+from mmdet.models.roi_heads.roi_extractors import SingleRoIExtractor
 
 def pos2embed(pos, num_pos_feats=128, temperature=10000):
     scale = 2 * math.pi
@@ -52,6 +58,385 @@ def pos2embed(pos, num_pos_feats=128, temperature=10000):
     pos_y = torch.stack((pos_y[..., 0::2].sin(), pos_y[..., 1::2].cos()), dim=-1).flatten(-2)
     posemb = torch.cat((pos_y, pos_x), dim=-1)
     return posemb
+
+def boxes3d_to_corners(bboxes3d):
+    """Tính 8 góc của bbox3D (N,7) -> (N,8,3)."""
+    bboxes3d = bboxes3d[:, :7]  # lấy x, y, z, l, w, h, yaw
+    centers = bboxes3d[:, :3]
+    dims = bboxes3d[:, 3:6]
+    yaws = bboxes3d[:, 6]
+
+    # 8 góc tương đối
+    corners_rel = torch.tensor([
+        [ 0.5,  0.5, -0.5],
+        [ 0.5, -0.5, -0.5],
+        [-0.5, -0.5, -0.5],
+        [-0.5,  0.5, -0.5],
+        [ 0.5,  0.5,  0.5],
+        [ 0.5, -0.5,  0.5],
+        [-0.5, -0.5,  0.5],
+        [-0.5,  0.5,  0.5],
+    ], device=bboxes3d.device).unsqueeze(0)  # [1,8,3]
+
+    corners_rel = corners_rel * dims.unsqueeze(1)  # [N,8,3]
+
+    # rotation quanh trục z
+    cosa, sina = torch.cos(yaws), torch.sin(yaws)
+    zeros, ones = torch.zeros_like(cosa), torch.ones_like(cosa)
+    rot = torch.stack([
+        torch.stack([cosa, -sina, zeros], -1),
+        torch.stack([sina,  cosa, zeros], -1),
+        torch.stack([zeros, zeros, ones], -1)
+    ], 1)  # [N,3,3]
+
+    corners = torch.bmm(corners_rel, rot.permute(0,2,1)) + centers.unsqueeze(1)  # [N,8,3]
+    return corners
+
+def project_bbox3d_to_2d(bboxes3d, lidar2img, img_shape):
+    """
+    Project bbox3D từ LiDAR sang từng view camera.
+    bboxes3d: (B,N,7 or 10)
+    lidar2img: (B,V,4,4)
+    img_shape: (H,W)
+    return: (B,V,N,4) x1,y1,x2,y2
+    """
+    B, N, D = bboxes3d.shape
+    _, V, _, _ = lidar2img.shape
+    H, W = img_shape
+    boxes_2d = []
+
+    for b in range(B):
+        corners = boxes3d_to_corners(bboxes3d[b])  # [N,8,3]
+        corners_hom = torch.cat([corners, torch.ones((N,8,1), device=bboxes3d.device)], -1)  # [N,8,4]
+
+        view_boxes = []
+        for v in range(V):
+            proj = torch.matmul(lidar2img[b, v], corners_hom.permute(0,2,1))  # [N,4,8]
+            proj = proj.permute(0,2,1)
+            u = proj[:,:,0] / proj[:,:,2]
+            v_ = proj[:,:,1] / proj[:,:,2]
+
+            x1 = torch.clamp(u.min(1).values, 0, W)
+            y1 = torch.clamp(v_.min(1).values, 0, H)
+            x2 = torch.clamp(u.max(1).values, 0, W)
+            y2 = torch.clamp(v_.max(1).values, 0, H)
+            view_boxes.append(torch.stack([x1,y1,x2,y2], -1))  # [N,4]
+        view_boxes = torch.stack(view_boxes,0)  # [V,N,4]
+        boxes_2d.append(view_boxes)
+    return torch.stack(boxes_2d,0)  # [B,V,N,4]
+
+
+@LOSSES.register_module()
+class Contrastive3D2DLoss(nn.Module):
+    def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
+        super().__init__()
+        self.proj2d = nn.Sequential(
+            nn.Linear(dim2d, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        # Projection head cho 3D
+        self.proj3d = nn.Sequential(
+            nn.Linear(dim3d, proj_dim),
+            nn.BatchNorm1d(proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.temperature = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self, feat2d, feat3d):
+        """
+        feat2d: [N, C2, 7, 7]
+        feat3d: [N, 7, 7, 7, C3]
+        """
+        N = feat2d.shape[0]
+
+        # 1. Pooling để mỗi box còn 1 vector
+        feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(N, -1)    # [N, C2]
+        feat3d = F.adaptive_avg_pool3d(feat3d.permute(0,4,1,2,3), 1).view(N, -1)  # [N, C3]
+
+        # 2. Projection
+        z2d = self.proj2d(feat2d.float())   # [N, proj_dim]
+        z3d = self.proj3d(feat3d.float())   # [N, proj_dim]
+
+        # 3. Normalize
+        z2d = F.normalize(z2d, dim=-1)
+        z3d = F.normalize(z3d, dim=-1)
+
+        # 4. InfoNCE logits
+        logits = z2d @ z3d.T / self.temperature  # [N, N]
+        labels = torch.arange(N, device=feat2d.device)
+        loss = F.cross_entropy(logits, labels) * self.loss_weight
+        return loss
+
+@LOSSES.register_module()
+# class SupCon3D2DLoss(nn.Module):
+#     def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
+#         super().__init__()
+#         self.proj2d = nn.Sequential(
+#             nn.Linear(dim2d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.proj3d = nn.Sequential(
+#             nn.Linear(dim3d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.temperature = temperature
+#         self.loss_weight = loss_weight
+
+#     def forward(self, feat2d, feat3d, group_ids):
+#         """
+#         feat2d: [M, C2, 7, 7]   -> RoI features (multi-view)
+#         feat3d: [N, 7, 7, 7, C3] -> Voxel features (1 per object)
+#         group_ids: [M] tensor, chỉ định RoI này thuộc object nào (0..N-1)
+#         """
+#         M = feat2d.shape[0]
+#         N = feat3d.shape[0]
+
+#         # 1. Pooling
+#         feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)  # [M, C2]
+#         feat3d = F.adaptive_avg_pool3d(feat3d.permute(0,4,1,2,3), 1).view(N, -1)  # [N, C3]
+
+#         # 2. Projection
+#         z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)  # [M, proj_dim]
+#         z3d = F.normalize(self.proj3d(feat3d.float()), dim=-1)  # [N, proj_dim]
+
+#         # 3. Tính similarity giữa tất cả voxel và tất cả RoI
+#         logits = torch.matmul(z3d, z2d.T) / self.temperature  # [N, M]
+
+#         # 4. Tạo mask multi-positive: voxel i positive với tất cả RoI có group_ids == i
+#         mask = torch.zeros((N, M), device=feat2d.device)
+#         for i in range(N):
+#             mask[i, group_ids == i] = 1
+
+#         # 5. SupCon loss
+#         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+#         logits = logits - logits_max.detach()  # ổn định số học
+#         exp_logits = torch.exp(logits) * (1 - torch.eye(N, M, device=feat2d.device)[:,:M])
+
+#         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+#         mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+#         loss = - mean_log_prob_pos.mean()
+
+#         return loss * self.loss_weight
+
+# class SupCon3D2DLoss(nn.Module):
+#     def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
+#         super().__init__()
+#         self.proj2d = nn.Sequential(
+#             nn.Linear(dim2d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.proj3d = nn.Sequential(
+#             nn.Linear(dim3d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.temperature = temperature
+#         self.loss_weight = loss_weight
+
+#     def forward(self, feat2d, feat3d, group_ids):
+#         """
+#         feat2d: [M, C2, 7, 7]   -> RoI features
+#         feat3d: [N, 7, 7, 7, C3] -> Voxel features (flatten theo batch)
+#         group_ids: [M] tensor, chỉ định RoI thuộc object nào (theo index đã flatten)
+#         """
+#         M = feat2d.shape[0]
+#         N = feat3d.shape[0]
+
+#         # Pooling
+#         feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)          # [M, C2]
+#         feat3d = F.adaptive_avg_pool3d(feat3d.permute(0,4,1,2,3), 1).view(N, -1)  # [N, C3]
+
+#         # Projection
+#         z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)  # [M, proj_dim]
+#         z3d = F.normalize(self.proj3d(feat3d.float()), dim=-1)  # [N, proj_dim]
+
+#         # Similarity
+#         logits = torch.matmul(z3d, z2d.T) / self.temperature  # [N, M]
+
+#         # Mask: multi-positive
+#         mask = torch.zeros((N, M), device=feat2d.device)
+#         mask[group_ids, torch.arange(M, device=feat2d.device)] = 1
+
+#         # Contrastive loss
+#         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+#         logits = logits - logits_max.detach()
+#         exp_logits = torch.exp(logits)
+#         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+#         mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+#         loss = - mean_log_prob_pos.mean()
+#         return loss * self.loss_weight
+
+class SupCon3D2DLoss(nn.Module):
+    def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
+        super().__init__()
+        self.proj2d = nn.Sequential(
+            nn.Linear(dim2d, proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.proj3d = nn.Sequential(
+            nn.Linear(dim3d, proj_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_dim, proj_dim)
+        )
+        self.temperature = temperature
+        self.loss_weight = loss_weight
+
+    def forward(self, feat2d, feat3d, group_ids):
+        """
+        feat2d: [M, C2, 7, 7]
+        feat3d: either
+            - [N, D, H, W, C3]  (raw voxel, need pool), or
+            - [N, C3]          (pooled_aligned passed in)
+        group_ids: [M] flat indices
+        """
+        M = feat2d.size(0)
+
+        # 1) 2D pooling
+        feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)  # [M, C2]
+
+        # 2) 3D pooling if needed
+        if feat3d.ndim == 5:
+            # original code path
+            N = feat3d.size(0)
+            # permute to [N, C3, D, H, W]
+            f3 = feat3d.permute(0,4,1,2,3)
+            feat3d_vec = F.adaptive_avg_pool3d(f3, 1).view(N, -1)  # [N, C3]
+        elif feat3d.ndim == 2:
+            # already pooled: shape [N, C3]
+            feat3d_vec = feat3d
+            N = feat3d_vec.size(0)
+        else:
+            raise RuntimeError(f"feat3d must be 2D or 5D but got {feat3d.shape}")
+
+        # 3) Validate group_ids
+        assert group_ids.min() >= 0 and group_ids.max() < N, (
+            f"group_ids must be in [0, {N-1}], got {group_ids.min()}–{group_ids.max()}"
+        )
+
+        # 4) Projection + normalize
+        z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)       # [M, D]
+        z3d = F.normalize(self.proj3d(feat3d_vec.float()), dim=-1)   # [N, D]
+
+        # 5) Compute similarity [N, M]
+        logits = z3d @ z2d.T / self.temperature
+
+        # 6) Build positive mask
+        mask = torch.zeros((N, M), device=logits.device)
+        mask[group_ids, torch.arange(M, device=logits.device)] = 1
+
+        # 7) SupCon loss
+        logits = logits - logits.max(1, keepdim=True).values
+        exp_logits = torch.exp(logits)
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+        loss = - mean_log_prob_pos.mean()
+
+        return loss * self.loss_weight
+
+
+# class SupCon3D2DLoss(nn.Module):
+#     def __init__(self, dim2d=256, dim3d=128, proj_dim=128,
+#                  temperature=0.1, loss_weight=0.1,
+#                  queue_size=4096):
+#         super().__init__()
+#         self.proj2d = nn.Sequential(
+#             nn.Linear(dim2d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.proj3d = nn.Sequential(
+#             nn.Linear(dim3d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.temperature = temperature
+#         self.loss_weight = loss_weight
+#         self.queue_size = queue_size
+
+#         # Memory bank cho 3D features
+#         self.register_buffer("queue3d", torch.randn(self.queue_size, proj_dim))
+#         self.queue3d = F.normalize(self.queue3d, dim=1)
+#         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+
+#     @torch.no_grad()
+#     def _dequeue_and_enqueue(self, feats):
+#         """Cập nhật queue theo kiểu FIFO"""
+#         feats = F.normalize(feats, dim=1)
+#         batch_size = feats.shape[0]
+#         ptr = int(self.queue_ptr)
+#         end = (ptr + batch_size) % self.queue_size
+#         if end > ptr:
+#             self.queue3d[ptr:end] = feats
+#         else:
+#             self.queue3d[ptr:] = feats[:self.queue_size - ptr]
+#             self.queue3d[:end] = feats[self.queue_size - ptr:]
+#         self.queue_ptr[0] = (ptr + batch_size) % self.queue_size
+
+#     def forward(self, feat2d, feat3d, group_ids):
+#         """
+#         feat2d: [M, C2, 7, 7]
+#         feat3d: [N, D, H, W, C3] hoặc [N, C3]
+#         group_ids: [M] flat indices
+#         """
+#         M = feat2d.size(0)
+
+#         # 1) 2D pooling
+#         feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)  # [M, C2]
+
+#         # 2) 3D pooling nếu cần
+#         if feat3d.ndim == 5:
+#             N = feat3d.size(0)
+#             f3 = feat3d.permute(0,4,1,2,3)
+#             feat3d_vec = F.adaptive_avg_pool3d(f3, 1).view(N, -1)  # [N, C3]
+#         elif feat3d.ndim == 2:
+#             feat3d_vec = feat3d
+#             N = feat3d_vec.size(0)
+#         else:
+#             raise RuntimeError(f"feat3d must be 2D or 5D but got {feat3d.shape}")
+
+#         # 3) Validate group_ids
+#         assert group_ids.min() >= 0 and group_ids.max() < N, (
+#             f"group_ids must be in [0, {N-1}], got {group_ids.min()}–{group_ids.max()}"
+#         )
+
+#         # 4) Projection + normalize
+#         z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)       # [M, D]
+#         z3d = F.normalize(self.proj3d(feat3d_vec.float()), dim=-1)   # [N, D]
+
+#         # 5) Cập nhật queue
+#         with torch.no_grad():
+#             self._dequeue_and_enqueue(z3d.detach())
+
+#         # 6) Ghép queue vào 3D features
+#         z3d_all = torch.cat([z3d, self.queue3d.clone().detach()], dim=0)  # [N+Q, D]
+
+#         # 7) Compute similarity
+#         logits = z3d_all @ z2d.T / self.temperature  # [N+Q, M]
+
+#         # 8) Build positive mask (chỉ các sample thực, không tính queue)
+#         mask = torch.zeros((z3d_all.size(0), M), device=logits.device)
+#         mask[:N, torch.arange(M, device=logits.device)] = 1
+
+#         # 9) SupCon loss
+#         logits = logits - logits.max(1, keepdim=True).values
+#         exp_logits = torch.exp(logits)
+#         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+#         mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+#         loss = - mean_log_prob_pos.mean()
+
+#         return loss * self.loss_weight
 
 
 @HEADS.register_module()
@@ -85,6 +470,9 @@ class MV2DFusionHead(AnchorFreeHead):
                      class_weight=1.0),
                  loss_bbox=dict(type='L1Loss', loss_weight=5.0),
                  loss_iou=dict(type='GIoULoss', loss_weight=2.0),
+                #  loss_contrastive=dict(type='SupConLoss', loss_weight=1.0),
+                loss_contrastive=None,
+                # contrastive_head = None, 
                  train_cfg=dict(
                      assigner=dict(
                          type='HungarianAssigner3D',
@@ -185,7 +573,19 @@ class MV2DFusionHead(AnchorFreeHead):
         self.prob_bin = prob_bin
 
         super(MV2DFusionHead, self).__init__(num_classes, in_channels, init_cfg=init_cfg)
+        self.roi = RoIAwarePool3d(
+            out_size=7,
+            max_pts_per_voxel=128,
+            mode='max'
+        )
+        self.roi2d = SingleRoIExtractor(
+            roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=-1),
+            out_channels=256,
+            featmap_strides=[4, 8, 16, 32, 64]
+        )
 
+        self.contrastive_loss = build_loss(loss_contrastive)# ModuleList([build_loss(loss_contrastive) for _ in range(6)])
+        
         self.loss_cls = build_loss(loss_cls)
         self.loss_bbox = build_loss(loss_bbox)
         self.loss_iou = build_loss(loss_iou)
@@ -632,7 +1032,7 @@ class MV2DFusionHead(AnchorFreeHead):
 
     def forward(self, img_metas, dyn_query=None, dyn_feats=None,
                 pts_query_center=None, pts_query_feat=None, pts_feat=None, pts_pos=None, **data):
-
+        print("MV@DFusion HEAD", pts_query_feat.shape, pts_feat.shape)
         # zero init the memory bank
         self.pre_update_memory(data)
 
@@ -699,7 +1099,6 @@ class MV2DFusionHead(AnchorFreeHead):
         pad_query_feats[:, pad_size + num_query_pts:pad_size + self.num_query] = query_feats
         tgt = self.dyn_q_enc(tgt, pad_query_feats)
 
-        # print("CHECK SHAPE QUERY:", pts_query_feat.shape, query_feats.shape)
         # query positional encoding
         query_pos = self.query_embedding(pos2posemb3d(reference_points))
         tgt, query_pos, reference_points, temp_memory, temp_pos, rec_ego_pose = \
@@ -926,7 +1325,7 @@ class MV2DFusionHead(AnchorFreeHead):
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list,
-                bbox_weights_list, num_total_pos, num_total_neg)
+                bbox_weights_list, num_total_pos, num_total_neg, pos_inds_list)
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds',))
     def loss_single(self,
@@ -934,7 +1333,12 @@ class MV2DFusionHead(AnchorFreeHead):
                     bbox_preds,
                     gt_bboxes_list,
                     gt_labels_list,
-                    gt_bboxes_ignore_list=None):
+                    pts_feats=None,
+                    pts_xyz=None,
+                    img_feats=None,
+                    lidar2img=None,
+                    image_shape=None,
+                    gt_bboxes_ignore_list=None, index=None):
         """"Loss function for outputs from a single decoder layer of a single
         feature level.
         Args:
@@ -964,11 +1368,367 @@ class MV2DFusionHead(AnchorFreeHead):
                                            gt_bboxes_ignore_list)
 
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
-         num_total_pos, num_total_neg) = cls_reg_targets
+         num_total_pos, num_total_neg, pos_inds_list) = cls_reg_targets
         labels = torch.cat(labels_list, 0)
         label_weights = torch.cat(label_weights_list, 0)
         bbox_targets = torch.cat(bbox_targets_list, 0)
         bbox_weights = torch.cat(bbox_weights_list, 0)
+        # print("BBOX WEIGHTs:", bbox_weights.shape, bbox_targets.shape, labels.shape, pos_inds_list)
+
+        if pts_feats is not None:
+            # print("LOSS SINGLE", pts_feats.shape, pos_inds_list)
+            # bbox_preds_ = bbox_preds[:,pos_inds_list[0],:]
+            # for bbox in bbox_preds_:
+            #     print(bbox.shape)
+            # # print("CHECK pre", bbox_preds_.shape, lidar2img.shape, bbox_preds_.max())
+            # # try:
+            # bbox_projected = project_bbox3d_to_2d(bbox_preds_, lidar2img, image_shape)
+            # print("bbox_projected", bbox_projected.shape, bbox_projected.max())
+            # # Check bbox sanity
+            # if torch.isnan(bbox_projected).any():
+            #     print("NaN found in bbox_projected!")
+            
+            # # Extract features
+            # for fet in img_feats:
+            #     print("IN LOSS SINGLE:", fet.shape, fet.max(), fet.min())
+            """o day tiep"""
+            
+            """
+            # bbox_projected: [B, V, N, 4]
+            B, V, N, D = bbox_projected.shape
+            rois_by_view = []
+
+            # Bước 1: Chuẩn bị RoIs cho từng view
+            valid_indices_all = []
+            for v in range(V):
+                view_boxes = []
+                valid_indices_view = []
+                for b in range(B):
+                    boxes = bbox_projected[b, v]  # [N, 4]
+                    valid_mask = ~torch.all(boxes == 0, dim=-1)
+                    boxes = boxes[valid_mask]
+                    indices = torch.nonzero(valid_mask).squeeze(-1)
+                    view_boxes.append(boxes)
+                    valid_indices_view.append(indices)
+                rois = bbox2roi(view_boxes)
+                rois_by_view.append(rois)
+                valid_indices_all.append(valid_indices_view)
+
+            # Bước 2: Trích xuất ROI features
+            roi_feats_by_view = []
+            for v in range(V):
+                # Giả sử img_feats là list [level1, level2, ...], mỗi level: [B, V, C, H, W]
+                feats_for_view = [lvl_feats[v, :, :, :].unsqueeze(0) for lvl_feats in img_feats]  # List[B, C, H, W]
+                
+                # Debug
+                for i, f in enumerate(feats_for_view):
+                    print(f"Level {i} view {v} feature shape:", f.shape)
+                print("ROI levels:", rois_by_view[v][:, 0].unique())
+
+                roi_feats = self.roi2d(feats_for_view, rois_by_view[v])  # [num_rois, C, 7, 7]
+                print("CHECK ROI each view:", roi_feats.shape, roi_feats.max(), roi_feats.min())
+                roi_feats_by_view.append(roi_feats)
+            """
+
+            
+            # pooled_features = self.roi(
+            #     rois=bbox_preds_[0, :, :7].contiguous(),               # (1, M, 7)
+            #     pts=pts_xyz,             # (1, N, 3)
+            #     pts_feature=pts_feats,     # (1, N, C)
+            # )
+            
+            """
+            loss_contrastive = 0.0
+            for head_idx, head in enumerate(self.contrastive_head):
+                head_losses = []
+                for v in range(V):   # num_views = 5
+                    roi_feats = roi_feats_by_view[v]  # [num_rois, C, 7, 7]
+                    # print("HẸ HẸ", roi_feats.shape, pooled_features[valid_indices_all[v]].shape)
+                    loss = head(roi_feats, pooled_features[valid_indices_all[v]])
+                    head_losses.append(loss)
+                # Cộng hoặc trung bình loss của 5 view
+                # losses[f'aux_head{head_idx}_loss'] = torch.stack(head_losses).mean()
+                loss_contrastive += torch.stack(head_losses).mean()
+            """
+            # # bbox_projected: [B, V, N, 4]
+            # B, V, N, _ = bbox_projected.shape
+            # image_h, image_w = image_shape
+
+            # rois_by_view = []
+            # group_ids_all = []
+
+            # for v in range(V):
+            #     view_boxes = []
+            #     group_ids_view = []
+
+            #     for b in range(B):
+            #         boxes = bbox_projected[b, v]
+
+            #         # --- Clip vào frame & loại box rỗng ---
+            #         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, image_w - 1)
+            #         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, image_h - 1)
+            #         w = boxes[:, 2] - boxes[:, 0]
+            #         h = boxes[:, 3] - boxes[:, 1]
+            #         valid_mask = (w > 1) & (h > 1) & ~torch.all(boxes == 0, dim=-1)
+            #         boxes = boxes[valid_mask]
+            #         indices = torch.nonzero(valid_mask).squeeze(-1)
+
+            #         if boxes.numel() == 0:
+            #             continue
+
+            #         view_boxes.append(boxes)
+            #         group_ids_view.append(indices + b * N)  # shift index theo batch
+
+            #     if len(view_boxes) == 0:
+            #         continue
+            #     rois = bbox2roi(view_boxes)
+            #     rois_by_view.append(rois)
+            #     group_ids_all.append(torch.cat(group_ids_view))
+
+            # # --- Trích xuất RoI features ---
+            # all_roi_feats = []
+            # all_group_ids = []
+            # for v, rois in enumerate(rois_by_view):
+            #     feats_for_view = [lvl_feats[v, :, :, :].unsqueeze(0) for lvl_feats in img_feats]  # lấy feature từng view
+            #     roi_feats = self.roi2d(feats_for_view, rois)  # [num_rois, C, 7, 7]
+            #     all_roi_feats.append(roi_feats)
+            #     all_group_ids.append(group_ids_all[v])
+
+            # if len(all_roi_feats) == 0:
+            #     roi_feats_final = torch.empty(0, device=bbox_projected.device)
+            #     group_ids_final = torch.empty(0, dtype=torch.long, device=bbox_projected.device)
+            # else:
+            #     roi_feats_final = torch.cat(all_roi_feats, dim=0)
+            #     group_ids_final = torch.cat(all_group_ids, dim=0)
+
+            #             # --- Lấy voxel features tương ứng ---
+            # # pooled_aligned = pooled_features.view(-1, pooled_features.shape[-1])[group_ids_final]  # [M, C3]
+
+            # # --- Contrastive Loss ---
+            # loss_contrastive = self.contrastive_loss(
+            #     roi_feats_final,        # [M, C, 7,7]
+            #     pooled_features,          # [M, C3]
+            #     group_ids_final
+            # )
+
+
+            """phan tach o day """
+            # # … trước đó bạn đã có:
+            # pooled_features = self.roi(
+            #     rois=bbox_preds_[0, :, :7].contiguous(),  # (1, M, 7)
+            #     pts=pts_xyz,                              # (1, N, 3)
+            #     pts_feature=pts_feats,                    # (1, N, C3)
+            # )  # pooled_features: [1, N, C3]
+
+            # # --- 1) Hãy detach pooled_features để không ảnh hưởng backward của detection ---
+            # pooled_feats = pooled_features#.detach()  # [1, N, C3]
+
+            # # --- 2) Chuẩn bị các RoI 2D độc lập cho contrastive ---
+            # B, V, N, _ = bbox_projected.shape
+            # img_h, img_w = image_shape
+            # all_roi_feats = []
+            # all_group_ids = []
+
+            # for v in range(V):
+            #     view_boxes = []
+            #     group_ids_v = []
+            #     for b in range(B):
+            #         boxes = bbox_projected[b, v].clone()
+            #         # Clip và filter
+            #         boxes[:, [0,2]] = boxes[:, [0,2]].clamp(0, img_w-1)
+            #         boxes[:, [1,3]] = boxes[:, [1,3]].clamp(0, img_h-1)
+            #         w = boxes[:,2] - boxes[:,0]
+            #         h = boxes[:,3] - boxes[:,1]
+            #         valid = (w>1) & (h>1)
+            #         idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            #         if idx.numel()==0:
+            #             continue
+            #         view_boxes.append(boxes[valid])
+            #         # shift index để flatten theo batch
+            #         group_ids_v.append(b * N + idx)
+            #     if not view_boxes:
+            #         continue
+            #     rois = bbox2roi(view_boxes)  # [M_v,5]
+            #     roi_feats = self.roi2d(
+            #         [lvl_feats[v].unsqueeze(0) for lvl_feats in img_feats],
+            #         rois
+            #     )  # [M_v, C2, 7,7]
+            #     all_roi_feats.append(roi_feats)
+            #     all_group_ids.append(torch.cat(group_ids_v))
+
+            # if len(all_roi_feats) > 0:
+            #     # Gộp tất cả view
+            #     roi_feats_final = torch.cat(all_roi_feats, dim=0)      # [M_tot, C2,7,7]
+            #     group_ids_final = torch.cat(all_group_ids, dim=0)      # [M_tot]
+
+            #     # --- 3) Lấy đúng pooled voxel features tương ứng ---
+            #     # pooled_feats: [1, N, C3] -> flatten thành [B*N, C3]
+            #     pooled_flat = pooled_feats.view(-1, pooled_feats.size(-1))  # [B*N, C3]
+            #     # index ra [M_tot, C3]
+            #     pooled_aligned = pooled_flat[group_ids_final]               # [M_tot, C3]
+
+            #     # --- 4) Tính contrastive loss ---
+            #     with torch.cuda.amp.autocast(enabled=False):
+            #         loss_contrastive = self.contrastive_loss(
+            #             roi_feats_final,     # [M_tot, C2,7,7]
+            #             pooled_aligned,      # [M_tot, C3]
+            #             group_ids_final % N  # object index trong mỗi sample
+            #         )
+            # else:
+            #     loss_contrastive = pooled_feats.new_tensor(0.)
+
+
+            '''MAIN'''
+            # print("LOSS SINGLE", pts_feats.shape, pos_inds_list)
+            # # --- Lấy bbox theo từng batch ---
+            # bbox_selected = []
+            # for b in range(bbox_preds.size(0)):  # B
+            #     inds = pos_inds_list[b]
+            #     if inds.numel() > 0:
+            #         bbox_selected.append(bbox_preds[b:b+1, inds, :])  # (1, M_b, 7)
+            #     else:
+            #         bbox_selected.append(bbox_preds.new_zeros((1, 0, bbox_preds.size(-1))))
+            # bbox_preds_ = torch.cat(bbox_selected, dim=1)  # [1, M_total, 7] để dùng chung với self.roi
+
+            # for bbox in bbox_preds_:
+            #     print(bbox.shape)
+
+            # # --- Project 3D box sang 2D ---
+            # bbox_projected = project_bbox3d_to_2d(bbox_preds_, lidar2img, image_shape)
+
+            # # --- Pooled voxel features ---
+            # pooled_features = self.roi(
+            #     rois=bbox_preds_[0, :, :7].contiguous(),  # (1, M_total, 7)
+            #     pts=pts_xyz,                              # (1, N, 3)
+            #     pts_feature=pts_feats,                    # (1, N, C3)
+            # )  # [1, N, C3]
+            # pooled_feats = pooled_features  # Không detach để contrastive cũng backprop
+
+            # # --- Chuẩn bị RoI 2D ---
+            # B, V, N, _ = bbox_projected.shape
+            # img_h, img_w = image_shape
+            # all_roi_feats = []
+            # all_group_ids = []
+
+            # for v in range(V):
+            #     view_boxes = []
+            #     group_ids_v = []
+            #     for b in range(B):
+            #         boxes = bbox_projected[b, v].clone()
+            #         # Clip và filter
+            #         boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, img_w - 1)
+            #         boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, img_h - 1)
+            #         w = boxes[:, 2] - boxes[:, 0]
+            #         h = boxes[:, 3] - boxes[:, 1]
+            #         valid = (w > 1) & (h > 1)
+            #         idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+            #         if idx.numel() == 0:
+            #             continue
+            #         view_boxes.append(boxes[valid])
+            #         group_ids_v.append(b * N + idx)  # Flatten index
+            #     if not view_boxes:
+            #         continue
+            #     rois = bbox2roi(view_boxes)  # [M_v, 5]
+            #     roi_feats = self.roi2d(
+            #         [lvl_feats[v].unsqueeze(0) for lvl_feats in img_feats],
+            #         rois
+            #     )  # [M_v, C2, 7,7]
+            #     all_roi_feats.append(roi_feats)
+            #     all_group_ids.append(torch.cat(group_ids_v))
+
+            # if len(all_roi_feats) > 0:
+            #     roi_feats_final = torch.cat(all_roi_feats, dim=0)  # [M_tot, C2,7,7]
+            #     group_ids_final = torch.cat(all_group_ids, dim=0)  # [M_tot]
+
+            #     # --- Align pooled features ---
+            #     pooled_flat = pooled_feats.view(-1, pooled_feats.size(-1))  # [B*N, C3]
+            #     pooled_aligned = pooled_flat[group_ids_final]               # [M_tot, C3]
+
+            #     # --- Contrastive loss ---
+            #     with torch.cuda.amp.autocast(enabled=False):
+            #         loss_contrastive = self.contrastive_loss(
+            #             roi_feats_final,     # [M_tot, C2,7,7]
+            #             pooled_aligned,      # [M_tot, C3]
+            #             group_ids_final % N  # object index trong mỗi sample
+            #         )
+            # else:
+            #     loss_contrastive = pooled_feats.new_tensor(0.)
+            '''trên là batch 1'''
+            # --- Lấy bbox theo từng batch ---
+            bbox_selected = []
+            print(f"so lương pos: {pos_inds_list}")
+            for b in range(bbox_preds.size(0)):  # B
+                inds = pos_inds_list[b]
+                if inds.numel() > 0:
+                    bbox_selected.append(bbox_preds[b:b+1, inds, :])  # (1, M_b, 7)
+                else:
+                    bbox_selected.append(bbox_preds.new_zeros((1, 0, bbox_preds.size(-1))))
+            bbox_preds_ = torch.cat(bbox_selected, dim=1)  # [1, M_total, 7]
+            bbox_projected = project_bbox3d_to_2d(bbox_preds_, lidar2img, image_shape)
+            pooled_features = self.roi(
+                rois=bbox_preds_[0, :, :7].contiguous(),  # (1, M_total, 7)
+                pts=pts_xyz,                              # (1, N, 3)
+                pts_feature=pts_feats,                    # (1, N, C3)
+            )  # [1, N_obj, C3]
+            pooled_flat = pooled_features.view(pooled_features.shape[0], -1, pooled_features.shape[-1])  # [B, N_obj, C3]
+            B, N_obj, C3 = pooled_flat.shape
+            pooled_flat = pooled_flat.view(-1, C3)  # [B * N_obj, C3]
+
+            B, V, N, _ = bbox_projected.shape
+            img_h, img_w = image_shape
+            all_roi_feats = []
+            all_group_ids = []
+
+            for v in range(V):
+                view_boxes = []
+                group_ids_v = []
+                for b in range(B):
+                    boxes = bbox_projected[b, v].clone()
+                    # Clip và filter
+                    boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, img_w - 1)
+                    boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, img_h - 1)
+                    w = boxes[:, 2] - boxes[:, 0]
+                    h = boxes[:, 3] - boxes[:, 1]
+                    valid = (w > 1) & (h > 1)
+                    idx = torch.nonzero(valid, as_tuple=False).squeeze(1)
+                    if idx.numel() == 0:
+                        continue
+                    view_boxes.append(boxes[valid])
+                    # *** FIX OFFSET ***:
+                    # Mỗi sample có N_obj object, flatten index = b * N_obj + idx
+                    group_ids_v.append(idx + b * N_obj)
+                if not view_boxes:
+                    continue
+                rois = bbox2roi(view_boxes)  # [M_v, 5]
+                roi_feats = self.roi2d(
+                    [lvl_feats[v].unsqueeze(0) for lvl_feats in img_feats],
+                    rois
+                )  # [M_v, C2,7,7]
+                all_roi_feats.append(roi_feats)
+                all_group_ids.append(torch.cat(group_ids_v))
+
+            if len(all_roi_feats) > 0:
+                roi_feats_final = torch.cat(all_roi_feats, dim=0)      # [M_tot, C2,7,7]
+                group_ids_final = torch.cat(all_group_ids, dim=0)     # [M_tot]
+            else:
+                # không có RoI 2D nào, bỏ qua contrastive
+                loss_contrastive = pooled_feats.new_tensor(0.)
+
+            # pooled_flat: [B*N_obj, C3]
+            with torch.cuda.amp.autocast(enabled=False):
+                loss_contrastive = self.contrastive_loss(
+                    roi_feats_final,        # [M_tot, C2,7,7]
+                    pooled_flat,            # [B*N_obj, C3]
+                    group_ids_final         # [M_tot], trong [0, B*N_obj-1]
+                )
+
+
+
+        else: 
+            loss_contrastive = torch.tensor(0.0, device=gt_labels_list[0].device)
+
+
+        
 
         # classification loss
         if isinstance(cls_scores, (tuple, list)):
@@ -976,6 +1736,7 @@ class MV2DFusionHead(AnchorFreeHead):
         else:
             cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
         # construct weighted avg_factor to match with the official DETR repo
+        # print("CHECK POINT 2")
         cls_avg_factor = num_total_pos * 1.0 + \
                          num_total_neg * self.bg_cls_weight
         if self.sync_cls_avg_factor:
@@ -1008,7 +1769,7 @@ class MV2DFusionHead(AnchorFreeHead):
 
         loss_cls = torch.nan_to_num(loss_cls)
         loss_bbox = torch.nan_to_num(loss_bbox)
-        return loss_cls, loss_bbox
+        return loss_cls, loss_bbox, loss_contrastive
 
     def dn_loss_single(self,
                        cls_scores,
@@ -1073,6 +1834,11 @@ class MV2DFusionHead(AnchorFreeHead):
              gt_bboxes_list,
              gt_labels_list,
              preds_dicts,
+             pts_feats,
+             pts_xyz,
+             img_feats,
+             lidar2img,
+             img_shape,
              gt_bboxes_ignore=None):
         """"Loss function.
         Args:
@@ -1106,8 +1872,9 @@ class MV2DFusionHead(AnchorFreeHead):
 
         all_cls_scores = preds_dicts['all_cls_scores']
         all_bbox_preds = preds_dicts['all_bbox_preds']
-
+        # print("loss bbox preds:", all_bbox_preds.shape)
         num_dec_layers = len(all_cls_scores)
+        print("num_dec_layers", num_dec_layers)
         device = gt_labels_list[0].device
         gt_bboxes_list = [torch.cat(
             (gt_bboxes.gravity_center, gt_bboxes.tensor[:, 3:]),
@@ -1119,15 +1886,27 @@ class MV2DFusionHead(AnchorFreeHead):
             gt_bboxes_ignore for _ in range(num_dec_layers)
         ]
 
+        pts_feats_ = torch.stack([pts_feats for _ in range(num_dec_layers)], dim=0)
+        pts_xyz_ = torch.stack([pts_xyz for _ in range(num_dec_layers)], dim=0)
+        img_feats_ = [img_feats for _ in range(num_dec_layers)]
+        lidar2img_ = torch.stack([lidar2img for _ in range(num_dec_layers)], dim=0)
+        image_shape_ = [img_shape for _ in range(num_dec_layers)]
+
         self.assigner.layer_indicator = 1
-        losses_cls, losses_bbox = multi_apply(
+        losses_cls, losses_bbox, loss_contrastive = multi_apply(
             self.loss_single, all_cls_scores, all_bbox_preds,
-            all_gt_bboxes_list, all_gt_labels_list,
-            all_gt_bboxes_ignore_list)
+            all_gt_bboxes_list, all_gt_labels_list, 
+            pts_feats_,
+            pts_xyz_,
+            img_feats_,
+            lidar2img_,
+            image_shape_,
+            all_gt_bboxes_ignore_list, list(range(num_dec_layers)))
         self.assigner.layer_indicator = 0
 
         loss_dict = dict()
-
+        print("CHECK CONTRASTIVE", loss_contrastive)
+        loss_dict['loss_contrastive'] = torch.stack(loss_contrastive).sum()
         # loss_dict['size_loss'] = size_loss
         # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
@@ -1167,6 +1946,7 @@ class MV2DFusionHead(AnchorFreeHead):
             dn_losses_cls, dn_losses_bbox = multi_apply(
                 self.loss_single, all_cls_scores, all_bbox_preds,
                 all_gt_bboxes_list, all_gt_labels_list,
+                pts_feats_, img_feats_, lidar2img_,
                 all_gt_bboxes_ignore_list)
             loss_dict['dn_loss_cls'] = dn_losses_cls[-1].detach()
             loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1].detach()
@@ -1176,8 +1956,7 @@ class MV2DFusionHead(AnchorFreeHead):
                 loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i.detach()
                 loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i.detach()
                 num_dec_layer += 1
-                
-        # loss_dict["contrastive_loss"] = torch.nn.functional.normalize(image_query_feats), torch.nn.functional.normalize(pc_query_feats)
+
         return loss_dict
 
     @force_fp32(apply_to=('preds_dicts'))

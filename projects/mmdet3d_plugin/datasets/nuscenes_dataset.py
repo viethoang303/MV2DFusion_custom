@@ -302,128 +302,62 @@ class CustomNuScenesDataset(NuScenesDataset):
 
         queue = queue[-1]
         
-        bbox3d = queue["gt_bboxes_3d"].data[0]  # (N, 9)
-        all_views_match = []
+        # bbox3d = queue["gt_bboxes_3d"].data[0]  # (N, 9)
+        # all_views_match = []
 
-        for cam_id in range(6):
-            # Lấy ma trận chiếu LiDAR → Image
-            lidar2img = queue["lidar2img"].data[0][cam_id]  # (4, 4)
-            print(lidar2img.shape)
-            # Lấy 8 corners của bbox trong hệ LiDAR
-            corners_lidar = bbox3d.corners  # (N, 8, 3)
-            num_bbox, num_pts = corners_lidar.shape[:2]
+        # for cam_id in range(6):
+        #     # Lấy ma trận chiếu LiDAR → Image
+        #     lidar2img = queue["lidar2img"].data[0][cam_id]  # (4, 4)
+        #     print(lidar2img.shape)
+        #     # Lấy 8 corners của bbox trong hệ LiDAR
+        #     corners_lidar = bbox3d.corners  # (N, 8, 3)
+        #     num_bbox, num_pts = corners_lidar.shape[:2]
 
-            # Chuyển sang homogeneous coordinate
-            ones = corners_lidar.new_ones((num_bbox, num_pts, 1))  # (N, 8, 1)
-            points_hom = torch.cat([corners_lidar, ones], dim=-1)  # (N, 8, 4)
+        #     # Chuyển sang homogeneous coordinate
+        #     ones = corners_lidar.new_ones((num_bbox, num_pts, 1))  # (N, 8, 1)
+        #     points_hom = torch.cat([corners_lidar, ones], dim=-1)  # (N, 8, 4)
 
-            # Project sang ảnh qua lidar2img
-            points_flat = points_hom.view(-1, 4).T                    # (4, N*8)
-            proj = (lidar2img @ points_flat).T                        # (N*8, 4)
-            proj = proj.view(num_bbox, num_pts, 4)                    # (N, 8, 4)
+        #     # Project sang ảnh qua lidar2img
+        #     points_flat = points_hom.view(-1, 4).T                    # (4, N*8)
+        #     proj = (lidar2img @ points_flat).T                        # (N*8, 4)
+        #     proj = proj.view(num_bbox, num_pts, 4)                    # (N, 8, 4)
 
-            # Chuẩn hóa thành tọa độ ảnh 2D
-            eps = 1e-5
-            xy = proj[..., :2] / (proj[..., 2:3] + eps)               # (N, 8, 2)
+        #     # Chuẩn hóa thành tọa độ ảnh 2D
+        #     eps = 1e-5
+        #     xy = proj[..., :2] / (proj[..., 2:3] + eps)               # (N, 8, 2)
 
-            # Tính bounding box 2D (x1, y1, x2, y2) từ các corners
-            bbox_2d_projected = torch.cat([
-                xy.min(dim=1).values,  # (N, 2)
-                xy.max(dim=1).values   # (N, 2)
-            ], dim=-1)  # (N, 4)
+        #     # Tính bounding box 2D (x1, y1, x2, y2) từ các corners
+        #     bbox_2d_projected = torch.cat([
+        #         xy.min(dim=1).values,  # (N, 2)
+        #         xy.max(dim=1).values   # (N, 2)
+        #     ], dim=-1)  # (N, 4)
 
-            # Lấy GT bbox 2D tương ứng với camera view này
-            gt_bboxes_2d = queue["gt_bboxes"].data[0][cam_id]  # (M, 4)
+        #     # Lấy GT bbox 2D tương ứng với camera view này
+        #     gt_bboxes_2d = queue["gt_bboxes"].data[0][cam_id]  # (M, 4)
 
-            if len(gt_bboxes_2d) == 0:
-                continue  # Không có GT nào trong view này
+        #     if len(gt_bboxes_2d) == 0:
+        #         continue  # Không có GT nào trong view này
 
-            # Tính IoU giữa predicted và GT
-            ious = bbox_overlaps(bbox_2d_projected, gt_bboxes_2d, mode='iou')  # (N, M)
-            iou_max, gt_idx = ious.max(dim=1)  # (N,)
-            matched = iou_max >= 0.5
+        #     # Tính IoU giữa predicted và GT
+        #     ious = bbox_overlaps(bbox_2d_projected, gt_bboxes_2d, mode='iou')  # (N, M)
+        #     iou_max, gt_idx = ious.max(dim=1)  # (N,)
+        #     matched = iou_max >= 0.5
 
-            # matched_bbox_pred = bbox_2d_projected[matched] # (K, 4)
-            bbox3d_matched = bbox3d[matched]
-            matched_bbox_gt   = gt_bboxes_2d[gt_idx[matched]]         # (K, 4)
+        #     # matched_bbox_pred = bbox_2d_projected[matched] # (K, 4)
+        #     bbox3d_matched = bbox3d[matched]
+        #     matched_bbox_gt   = gt_bboxes_2d[gt_idx[matched]]         # (K, 4)
             
-            view_data = {
-                "cam_idx": cam_id,
-                "matched_pred": bbox3d_matched,
-                "matched_gt": matched_bbox_gt,
-                "iou": iou_max[matched]
-            }
-            all_views_match.append(view_data)
+        #     view_data = {
+        #         "cam_idx": cam_id,
+        #         "matched_pred": bbox3d_matched,
+        #         "matched_gt": matched_bbox_gt,
+        #         "iou": iou_max[matched]
+        #     }
+        #     all_views_match.append(view_data)
 
-        # Lưu tất cả matched pairs từ các views
-        queue["pairs"] = all_views_match
+        # # Lưu tất cả matched pairs từ các views
+        # queue["pairs"] = all_views_match
         
-        
-        
-        # # 1) Lấy ma trận projection và intrinsic từ DataContainer
-        # lidar2img_list = queue['lidar2img'].data[0]  # list of np.ndarray shape (4,4)
-        # intrs = queue['intrinsics'].data[0]          # list of np.ndarray shape (3,3) hoặc (4,4)
-        # # Chọn view 0
-        # rt_mat = lidar2img_list[0].float()    # Tensor (4,4)
-        # intrinsic_mat = intrs[0].float()      # Tensor (3,3) hoặc (4,4)
-
-        # # 2) Lấy tensor boxes3d và khởi tạo LiDARInstance3DBoxes
-        # boxes3d = queue['gt_bboxes_3d'].data[0]
-
-        # # 3) Convert all boxes sang camera frame và lấy corners
-        # boxes3d_cam = boxes3d.convert_to(Box3DMode.CAM, rt_mat)  # Instance3DBoxesCamera
-        # corners_cam = boxes3d_cam.corners  # Tensor (N3D, 8, 3)
-
-        # # 3) Tính bounding 2D và center 2D cho mỗi box3D
-        # proj_boxes = []
-        # centers3d = []  # sẽ chứa tọa độ 3D center
-        # for corners in boxes3d_cam.corners:  # (8,3)
-        #     # 3a) bounding 2D
-        #     pts2d = points_cam2img(corners, intrinsic_mat)  # (8,2)
-        #     x1, y1 = pts2d[:,0].min().item(), pts2d[:,1].min().item()
-        #     x2, y2 = pts2d[:,0].max().item(), pts2d[:,1].max().item()
-        #     proj_boxes.append([x1,y1,x2,y2])
-        # print(proj_boxes)
-        # # Dùng gravity_center để project center point
-        # centers3d_pts = boxes3d_cam.gravity_center  # (N,3)
-        # centers3d_homo = torch.cat([centers3d_pts, torch.ones((centers3d_pts.size(0),1))], dim=1)  # (N,4)
-        # centers2d_pts = points_cam2img(centers3d_homo[:,:3], intrinsic_mat)  # (N,2)
-
-        # proj_boxes = torch.tensor(proj_boxes, dtype=torch.float32)  # (N3D,4)
-
-        # # 4) Lấy box2D từ DataContainer (view 0 nếu multi-view)
-        # boxes_2d_data = queue['gt_bboxes'].data[0]
-        # boxes_2d = boxes_2d_data[0] if isinstance(boxes_2d_data, list) else boxes_2d_data  # (N2D,4)
-
-        # # 5) Tính IoU
-        # if proj_boxes.ndim < 2 or proj_boxes.shape[0] == 0 or \
-        #     boxes_2d.ndim < 2 or boxes_2d.shape[0] == 0:
-        #     queue["pair"] = []
-        #     return queue
-
-        # ious = bbox_overlaps(proj_boxes, boxes_2d)  # (N3D, N2D)
-
-        # if ious.numel() == 0:
-        #     queue["pair"] = []
-        #     return queue
-
-        # max_ious, indices = ious.max(dim=1)
-
-        # # Tính centers của box2D
-        # centers2d = (boxes_2d[:,:2] + boxes_2d[:,2:]) / 2  # (N2D,2)
-
-        # # 6) Mapping 3D->2D
-        # matches = []
-        # for i in range(proj_boxes.size(0)):
-        #     if max_ious[i] >= 0.5:
-        #         matches.append((i, int(indices[i])))
-        #     else:
-        #         # fallback: chọn 2D center gần projected center nhất
-        #         diffs = centers2d - centers2d_pts[i]
-        #         dists = torch.norm(diffs, dim=1)
-        #         matches.append((i, int(dists.argmin())))
-
-        # queue['pair'] = matches
         return queue
 
     def get_data_info(self, index):

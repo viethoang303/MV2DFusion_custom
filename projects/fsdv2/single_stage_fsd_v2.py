@@ -206,7 +206,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
 
         voxel_encoder_input = torch.cat([cat_pts, cat_feat], 1)
         voxel_feats, voxel_coors, unq_inv = self.voxel_encoder(voxel_encoder_input, coors, return_inv=True)
-
+        print("CHECK in fsdv2:", voxel_feats.shape, sampled_feats.shape)
         pts_indicators = torch.cat(
             [
                 torch.zeros(len(ori_pts), device=device, dtype=torch.float),
@@ -468,7 +468,7 @@ class SingleStageFSDV2(SingleStage3DDetector):
         gt_labels_3d = [l[l>=0] for l in gt_labels_3d]
 
         bsz = len(points)
-
+        print("SIZE", bsz)
         seg_out_dict = self.segmentor(points=points, img_metas=img_metas, gt_bboxes_3d=gt_bboxes_3d, gt_labels_3d=gt_labels_3d, as_subsegmentor=True)
 
         seg_feats = seg_out_dict['seg_feats']
