@@ -560,7 +560,7 @@ model = dict(
             dim3d=128,
             proj_dim=512,
             temperature=0.1,
-            loss_weight=1.0)
+            loss_weight=0.1)
         ),
     train_cfg=dict(fusion=dict(
         grid_size=[512, 512, 1],
