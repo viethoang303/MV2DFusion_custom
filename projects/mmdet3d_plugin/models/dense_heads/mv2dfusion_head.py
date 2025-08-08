@@ -174,6 +174,61 @@ class Contrastive3D2DLoss(nn.Module):
         return loss
 
 @LOSSES.register_module()
+# class SupCon3D2DLoss(nn.Module):
+#     def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
+#         super().__init__()
+#         self.proj2d = nn.Sequential(
+#             nn.Linear(dim2d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.proj3d = nn.Sequential(
+#             nn.Linear(dim3d, proj_dim),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(proj_dim, proj_dim)
+#         )
+#         self.temperature = temperature
+#         self.loss_weight = loss_weight
+
+#     def forward(self, feat2d, feat3d, group_ids):
+#         """
+#         feat2d: [M, C2, 7, 7]   -> RoI features (multi-view)
+#         feat3d: [N, 7, 7, 7, C3] -> Voxel features (1 per object)
+#         group_ids: [M] tensor, chỉ định RoI này thuộc object nào (0..N-1)
+#         """
+#         M = feat2d.shape[0]
+#         N = feat3d.shape[0]
+
+#         # 1. Pooling
+#         feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)  # [M, C2]
+#         feat3d = F.adaptive_avg_pool3d(feat3d.permute(0,4,1,2,3), 1).view(N, -1)  # [N, C3]
+
+#         # 2. Projection
+#         z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)  # [M, proj_dim]
+#         z3d = F.normalize(self.proj3d(feat3d.float()), dim=-1)  # [N, proj_dim]
+
+#         # 3. Tính similarity giữa tất cả voxel và tất cả RoI
+#         logits = torch.matmul(z3d, z2d.T) / self.temperature  # [N, M]
+
+#         # 4. Tạo mask multi-positive: voxel i positive với tất cả RoI có group_ids == i
+#         mask = torch.zeros((N, M), device=feat2d.device)
+#         for i in range(N):
+#             mask[i, group_ids == i] = 1
+
+#         # 5. SupCon loss
+#         logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+#         logits = logits - logits_max.detach()  # ổn định số học
+#         exp_logits = torch.exp(logits) * (1 - torch.eye(N, M, device=feat2d.device)[:,:M])
+
+#         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
+
+#         mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
+#         print("LOSS CHECK:", mean_log_prob_pos.max(), mask.sum(1))
+#         loss = - mean_log_prob_pos.mean()
+
+#         return loss * self.loss_weight
+
+### SUPER TEST ###
 class SupCon3D2DLoss(nn.Module):
     def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
         super().__init__()
@@ -187,45 +242,66 @@ class SupCon3D2DLoss(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(proj_dim, proj_dim)
         )
+        self._init_weights()
         self.temperature = temperature
         self.loss_weight = loss_weight
 
+    def _init_weights(self):
+        for m in list(self.proj2d) + list(self.proj3d):
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
     def forward(self, feat2d, feat3d, group_ids):
-        """
-        feat2d: [M, C2, 7, 7]   -> RoI features (multi-view)
-        feat3d: [N, 7, 7, 7, C3] -> Voxel features (1 per object)
-        group_ids: [M] tensor, chỉ định RoI này thuộc object nào (0..N-1)
-        """
-        M = feat2d.shape[0]
-        N = feat3d.shape[0]
+        M = feat2d.shape[0]  # số RoI
+        N = feat3d.shape[0]  # số voxel
+
+        if M == 0 or N == 0:
+            return torch.tensor(0.0, device=feat2d.device, requires_grad=True)
 
         # 1. Pooling
         feat2d = F.adaptive_avg_pool2d(feat2d, 1).view(M, -1)  # [M, C2]
-        feat3d = F.adaptive_avg_pool3d(feat3d.permute(0,4,1,2,3), 1).view(N, -1)  # [N, C3]
+        feat3d = F.adaptive_avg_pool3d(feat3d.permute(0, 4, 1, 2, 3), 1).view(N, -1)  # [N, C3]
 
-        # 2. Projection
-        z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1)  # [M, proj_dim]
-        z3d = F.normalize(self.proj3d(feat3d.float()), dim=-1)  # [N, proj_dim]
+        # 2. Projection + Normalize (có eps)
+        z2d = F.normalize(self.proj2d(feat2d.float()), dim=-1, eps=1e-6)
+        z3d = F.normalize(self.proj3d(feat3d.float()), dim=-1, eps=1e-6)
 
-        # 3. Tính similarity giữa tất cả voxel và tất cả RoI
+        # 3. Similarity
         logits = torch.matmul(z3d, z2d.T) / self.temperature  # [N, M]
 
-        # 4. Tạo mask multi-positive: voxel i positive với tất cả RoI có group_ids == i
+        # 4. Mask multi-positive
         mask = torch.zeros((N, M), device=feat2d.device)
         for i in range(N):
             mask[i, group_ids == i] = 1
 
-        # 5. SupCon loss
-        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
-        logits = logits - logits_max.detach()  # ổn định số học
-        exp_logits = torch.exp(logits) * (1 - torch.eye(N, M, device=feat2d.device)[:,:M])
+        # 5. Bỏ các hàng không có positive
+        pos_counts = mask.sum(1)
+        valid_mask = pos_counts > 0
+        if valid_mask.sum() < 2:  # không đủ sample để contrastive
+            return torch.tensor(0.0, device=feat2d.device, requires_grad=True)
 
+        logits = logits[valid_mask]
+        mask = mask[valid_mask]
+        pos_counts = pos_counts[valid_mask]
+
+        # 6. Clamp logits để tránh overflow
+        logits = logits - logits.max(dim=1, keepdim=True)[0]  # ổn định số học
+
+        # 7. Tính log_prob
+        exp_logits = torch.exp(logits)
         log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-12)
 
-        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-12)
-        loss = - mean_log_prob_pos.mean()
+        # 8. Mean log-likelihood cho positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (pos_counts + 1e-12)
 
+        # 9. Loss
+        loss = - mean_log_prob_pos.mean()
         return loss * self.loss_weight
+
+ 
+
 
 # class SupCon3D2DLoss(nn.Module):
 #     def __init__(self, dim2d=256, dim3d=128, proj_dim=128, temperature=0.1, loss_weight=0.1):
